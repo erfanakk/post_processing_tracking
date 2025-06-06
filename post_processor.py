@@ -92,36 +92,42 @@ class TrackletSplitter:
         #    (get_batch_safe yields (idx, image) pairs)
         # -----------------------------------------------------------------
         # 2. decode those frames in CHUNKS
-        frame_buffer = {}
         sorted_unique = sorted(set(frames))
-        for i in range(0, len(sorted_unique), batch_size):
-            chunk = sorted_unique[i:i + batch_size]
-            try:
-                imgs = video_loader.get_batch(chunk)           # one C++→NumPy copy
-            except Exception as e:
-                logger.error(f"Decoding error for {track_id}: {e}")
-                return {}
-            for idx, img in zip(chunk, imgs):
-                frame_buffer[idx] = img
-        # 3. crop each bbox
-        # -----------------------------------------------------------------
+
+        # use a thread pool to preload next chunk
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = None
+
         crops, crop_frames = [], []
-        for fnum in frames:
-            bbox = tracking_data[fnum][entity_type][track_id].get("bbox")
-            if not (bbox and len(bbox) == 4):
-                continue
+        for i in range(0, len(sorted_unique), batch_size):
+            batch = sorted_unique[i:i + batch_size]
+            if future is None:
+                imgs = video_loader.get_batch(batch)
+            else:
+                imgs = future.result()
 
-            x1, y1, x2, y2 = map(int, bbox)
-            img = frame_buffer.get(fnum)
-            if img is None:
-                continue
+            next_batch = sorted_unique[i + batch_size:i + 2 * batch_size]
+            future = executor.submit(video_loader.get_batch, next_batch) if next_batch else None
 
-            h, w, _ = img.shape
-            x1, x2 = max(0, x1), min(w, x2)
-            y1, y2 = max(0, y1), min(h, y2)
-            if x2 > x1 and y2 > y1:
-                crops.append(img[y1:y2, x1:x2])
-                crop_frames.append(fnum)
+            for fnum, img in zip(batch, imgs):
+                bbox = tracking_data[fnum][entity_type][track_id].get("bbox")
+                if not (bbox and len(bbox) == 4):
+                    continue
+
+                x1, y1, x2, y2 = map(int, bbox)
+                if img is None:
+                    continue
+
+                h, w, _ = img.shape
+                x1, x2 = max(0, x1), min(w, x2)
+                y1, y2 = max(0, y1), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    crops.append(img[y1:y2, x1:x2])
+                    crop_frames.append(fnum)
+
+        if future is not None:
+            future.result()
+        executor.shutdown(wait=True)
 
         if len(crops) < self.min_samples * 2:
             logger.debug(f"{track_id}: only {len(crops)} valid crops – skip")
