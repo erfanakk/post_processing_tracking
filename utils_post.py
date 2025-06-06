@@ -10,6 +10,8 @@ import cv2
 
 from .video_processor import VideoFrameLoader
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor
+from . import config
 logger = logging.getLogger(__name__)
 
 def is_isolated(frame_data: Dict, object_id: str, entity_type: str, distance_threshold: float = 30.0) -> bool:
@@ -123,35 +125,50 @@ def extract_isolated_object_crops(video_path: str, tracking_data: List[Dict], en
     video_loader  = VideoFrameLoader(video_path)
     isolated_crops = {entity: [] for entity in entity_types}
 
-
     if metadata_video is not None:
         invalid_frames = get_invalid_frames(metadata_video, video_loader.frame_rate)
     else:
         invalid_frames = None
 
-    for frame_idx in range(start_frame, start_frame + max_frames, frame_step):
-        frame_data = tracking_data[frame_idx - start_frame] if frame_idx - start_frame < len(tracking_data) else {}
-        frame_image = video_loader.get_frame(frame_idx)
-        if (frame_image is None) or (not frame_data):
-            continue
-        if invalid_frames is not None and frame_idx in invalid_frames:
-            continue
+    frame_indices = list(range(start_frame, start_frame + max_frames, frame_step))
+    BATCH_SIZE = config.BATCH_SIZE
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = None
 
-        for entity_type in entity_types:
-            entities = frame_data.get(entity_type, {})
-            for entity_id, entity_info in entities.items():
-                # if is_isolated(frame_data, entity_id, entity_type, distance_threshold):
-                bbox = entity_info.get("bbox")
-                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                    x_min, y_min, x_max, y_max = map(int, bbox)
-                    h, w, _ = frame_image.shape
-                    x_min = max(0, x_min)
-                    y_min = max(0, y_min)
-                    x_max = min(w, x_max)
-                    y_max = min(h, y_max)
-                    if x_min < x_max and y_min < y_max:
-                        crop = frame_image[y_min:y_max, x_min:x_max]
-                        isolated_crops[entity_type].append(crop)
+    for i in range(0, len(frame_indices), BATCH_SIZE):
+        batch_idx = frame_indices[i:i + BATCH_SIZE]
+        if future is None:
+            frames = video_loader.get_batch(batch_idx)
+        else:
+            frames = future.result()
+        next_idx = frame_indices[i + BATCH_SIZE:i + 2 * BATCH_SIZE]
+        future = executor.submit(video_loader.get_batch, next_idx) if next_idx else None
+
+        for frame_idx, frame_image in zip(batch_idx, frames):
+            frame_data = tracking_data[frame_idx - start_frame] if frame_idx - start_frame < len(tracking_data) else {}
+            if (frame_image is None) or (not frame_data):
+                continue
+            if invalid_frames is not None and frame_idx in invalid_frames:
+                continue
+
+            for entity_type in entity_types:
+                entities = frame_data.get(entity_type, {})
+                for entity_id, entity_info in entities.items():
+                    bbox = entity_info.get("bbox")
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        x_min, y_min, x_max, y_max = map(int, bbox)
+                        h, w, _ = frame_image.shape
+                        x_min = max(0, x_min)
+                        y_min = max(0, y_min)
+                        x_max = min(w, x_max)
+                        y_max = min(h, y_max)
+                        if x_min < x_max and y_min < y_max:
+                            crop = frame_image[y_min:y_max, x_min:x_max]
+                            isolated_crops[entity_type].append(crop)
+
+    if future is not None:
+        future.result()
+    executor.shutdown(wait=True)
     video_loader.release()
     return isolated_crops
 
