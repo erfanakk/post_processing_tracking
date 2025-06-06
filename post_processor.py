@@ -8,6 +8,7 @@ from . import config
 from .data_loader import load_json, save_json
 from .video_processor import VideoFrameLoader
 from .utils_post import is_isolated , is_isolated_with_score
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from collections import defaultdict
 import random
@@ -91,36 +92,42 @@ class TrackletSplitter:
         #    (get_batch_safe yields (idx, image) pairs)
         # -----------------------------------------------------------------
         # 2. decode those frames in CHUNKS
-        frame_buffer = {}
         sorted_unique = sorted(set(frames))
-        for i in range(0, len(sorted_unique), batch_size):
-            chunk = sorted_unique[i:i + batch_size]
-            try:
-                imgs = video_loader.get_batch(chunk)           # one C++→NumPy copy
-            except Exception as e:
-                logger.error(f"Decoding error for {track_id}: {e}")
-                return {}
-            for idx, img in zip(chunk, imgs):
-                frame_buffer[idx] = img
-        # 3. crop each bbox
-        # -----------------------------------------------------------------
+
+        # use a thread pool to preload next chunk
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = None
+
         crops, crop_frames = [], []
-        for fnum in frames:
-            bbox = tracking_data[fnum][entity_type][track_id].get("bbox")
-            if not (bbox and len(bbox) == 4):
-                continue
+        for i in range(0, len(sorted_unique), batch_size):
+            batch = sorted_unique[i:i + batch_size]
+            if future is None:
+                imgs = video_loader.get_batch(batch)
+            else:
+                imgs = future.result()
 
-            x1, y1, x2, y2 = map(int, bbox)
-            img = frame_buffer.get(fnum)
-            if img is None:
-                continue
+            next_batch = sorted_unique[i + batch_size:i + 2 * batch_size]
+            future = executor.submit(video_loader.get_batch, next_batch) if next_batch else None
 
-            h, w, _ = img.shape
-            x1, x2 = max(0, x1), min(w, x2)
-            y1, y2 = max(0, y1), min(h, y2)
-            if x2 > x1 and y2 > y1:
-                crops.append(img[y1:y2, x1:x2])
-                crop_frames.append(fnum)
+            for fnum, img in zip(batch, imgs):
+                bbox = tracking_data[fnum][entity_type][track_id].get("bbox")
+                if not (bbox and len(bbox) == 4):
+                    continue
+
+                x1, y1, x2, y2 = map(int, bbox)
+                if img is None:
+                    continue
+
+                h, w, _ = img.shape
+                x1, x2 = max(0, x1), min(w, x2)
+                y1, y2 = max(0, y1), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    crops.append(img[y1:y2, x1:x2])
+                    crop_frames.append(fnum)
+
+        if future is not None:
+            future.result()
+        executor.shutdown(wait=True)
 
         if len(crops) < self.min_samples * 2:
             logger.debug(f"{track_id}: only {len(crops)} valid crops – skip")
@@ -451,23 +458,28 @@ class PostProcessor:
         self.tracking_data = tracking_data
         self.video_loader = video_loader
         self.frame_cache = LRUCache(maxsize=200)
-
+        self.preload_executor = ThreadPoolExecutor(max_workers=1)
 
     def get_cached_frame(self, frame_num):
         if frame_num in self.frame_cache:
             return self.frame_cache[frame_num]
-        else:
-            frame = self.video_loader.get_frame(frame_num)
-            self.frame_cache[frame_num] = frame
-            return frame
-    # def _preload_frames(self, frame_nums, batch_size=64):
-    #     """
-    #     Fetch missing frames into the LRU cache using VideoFrameLoader.get_batch_safe.
-    #     Will NOT touch frames already cached.
-    #     """
-    #     missing = [f for f in frame_nums if f not in self.frame_cache]
-    #     for idx, img in self.video_loader.get_batch_safe(missing, batch_size):
-    #         self.frame_cache[idx] = img
+        frame = self.video_loader.get_frame(frame_num)
+        self.frame_cache[frame_num] = frame
+        return frame
+
+    def _preload_frames(self, frame_nums, batch_size=64):
+        """Preload frames into the LRU cache using batch decoding."""
+        missing = [f for f in frame_nums if f not in self.frame_cache]
+        if not missing:
+            return
+        for idx, img in self.video_loader.get_batch_safe(missing, batch_size):
+            self.frame_cache[idx] = img
+
+    def _preload_frames_async(self, frame_nums, batch_size=64):
+        """Asynchronously preload frames into the cache."""
+        if not frame_nums:
+            return None
+        return self.preload_executor.submit(self._preload_frames, frame_nums, batch_size)
 
 
     #TODO CHANGE THIS FOR TIMEZONE BASED
@@ -1107,20 +1119,25 @@ class PostProcessor:
                         frame_track_bboxes[frame_num].append((track_id, bbox))
 
         # Process frames in batches to manage memory
-        BATCH_SIZE = 32  # Adjust based on your system's memory
+        BATCH_SIZE = self.batch_size
         frame_nums = sorted(frame_track_bboxes.keys())
-
-
-
-        # all_frame_nums = sorted(frame_track_bboxes.keys())
-        # self._preload_frames(all_frame_nums, batch_size=64)
-        # frame_img = self.frame_cache.get(frame_num)
 
 
         results = defaultdict(list)
         
+        prefetch_future = None
         for i in range(0, len(frame_nums), BATCH_SIZE):
             batch_frames = frame_nums[i:i + BATCH_SIZE]
+            if prefetch_future is None:
+                # Initial preload
+                self._preload_frames(batch_frames, batch_size=BATCH_SIZE)
+            else:
+                # Wait for async preload of current batch
+                prefetch_future.result()
+            # Start preloading next batch in background
+            next_frames = frame_nums[i + BATCH_SIZE:i + 2 * BATCH_SIZE]
+            prefetch_future = self._preload_frames_async(next_frames, batch_size=BATCH_SIZE)
+
             batch_crops = []
             batch_track_ids = []
             
@@ -1164,6 +1181,9 @@ class PostProcessor:
             del batch_crops
             del batch_track_ids
             gc.collect()  # Force garbage collection
+
+        if prefetch_future is not None:
+            prefetch_future.result()
 
         # Aggregate final results
         final_results = {}
@@ -1681,6 +1701,7 @@ class PostProcessor:
         save_json(self.summary_data, self.updated_summary_path)
 
         logger.info("Post-processing pipeline completed successfully.")
+        self.preload_executor.shutdown(wait=True)
         
 
 
